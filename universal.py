@@ -136,16 +136,22 @@ class ApiServer:
             }
 
         @self.app.get("/codes/{email}", response_model=List[EmailResponse])
-        async def get_codes(email: str, background_tasks: BackgroundTasks):
+        async def get_codes(
+            email: str,
+            background_tasks: BackgroundTasks,
+            query: Optional[str] = None
+        ):
             if not self.current_cookies or not self.current_ckey:
                 raise HTTPException(
                     status_code=400,
                     detail="No valid cookies or _ckey available"
                 )
-            
+
             try:
                 cookie_string = "; ".join([f"{c['name']}={c['value']}" for c in self.current_cookies])
-                
+
+                search_query = query.strip() if query else "code"
+
                 headers = {
                     "sec-ch-ua-platform": '"Windows"',
                     "X-Requested-With": "XMLHttpRequest",
@@ -161,7 +167,7 @@ class ApiServer:
                         "params": {
                             "count": str(BATCH_SIZE),
                             "first": "0",
-                            "request": "is your Facebook confirmation code",
+                            "request": search_query,
                             "search": "search",
                             "sort_type": "date"
                         }
@@ -185,6 +191,7 @@ class ApiServer:
 
                 data = response.json()
                 results = []
+                seen_email_codes = set()
 
                 if 'models' in data and data['models']:
                     model = data['models'][0]
@@ -193,28 +200,86 @@ class ApiServer:
                             if 'recipients' in message and 'to' in message['recipients']:
                                 to_email = message['recipients']['to']['email'].lower()
                                 if email.lower() in to_email:
-                                    if 'subject' in message:
-                                        numbers = re.findall(r'\d+', message['subject'])
-                                        if numbers:
-                                            results.append(EmailResponse(
-                                                email=to_email,
-                                                code=''.join(numbers),
-                                                subject=message['subject']
-                                            ))
+                                    extracted_codes = self._extract_codes(message)
+                                    for code_value in extracted_codes:
+                                        cache_key = (to_email, code_value)
+                                        if cache_key in seen_email_codes:
+                                            continue
+                                        seen_email_codes.add(cache_key)
+                                        results.append(EmailResponse(
+                                            email=to_email,
+                                            code=code_value,
+                                            subject=message.get('subject')
+                                        ))
 
-                background_tasks.add_task(self.log_request, email, len(results))
+                background_tasks.add_task(
+                    self.log_request,
+                    email,
+                    len(results),
+                    search_query,
+                )
                 return results
 
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
+
+    @staticmethod
+    def _extract_codes(message: Dict[str, Union[str, Dict, List]]) -> List[str]:
+        """Extract numeric verification codes from different parts of a message."""
+        text_sources = []
+
+        subject = message.get('subject')
+        if subject:
+            text_sources.append(subject)
+
+        snippet = message.get('snippet')
+        if snippet:
+            text_sources.append(snippet)
+
+        # Some responses contain the body text under data -> parts or text fields
+        data_field = message.get('data')
+        if isinstance(data_field, dict):
+            for key in ('text', 'body', 'message'):
+                nested_value = data_field.get(key)
+                if isinstance(nested_value, dict):
+                    for nested_text_key in ('text', 'full', 'snippet'):
+                        nested_text = nested_value.get(nested_text_key)
+                        if isinstance(nested_text, str):
+                            text_sources.append(nested_text)
+                elif isinstance(nested_value, str):
+                    text_sources.append(nested_value)
+
+        parts = message.get('parts')
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict):
+                    part_text = part.get('text')
+                    if isinstance(part_text, str):
+                        text_sources.append(part_text)
+
+        codes = []
+        seen_codes = set()
+        for text in text_sources:
+            for match in re.findall(r'\b\d{4,8}\b', text):
+                if match not in seen_codes:
+                    seen_codes.add(match)
+                    codes.append(match)
+
+        return codes
 
     def update_credentials(self, cookies, ckey):
         self.current_cookies = cookies
         self.current_ckey = ckey
         self.logger.info("Credentials updated successfully")
 
-    async def log_request(self, email: str, code_count: int):
-        self.logger.info(f"Code request for {email}: Found {code_count} codes")
+    async def log_request(self, email: str, code_count: int, query: str):
+        display_query = query or "<default>"
+        self.logger.info(
+            "Code request for %s with query '%s': Found %d codes",
+            email,
+            display_query,
+            code_count,
+        )
 
 
     def start(self):
@@ -733,7 +798,7 @@ class UnifiedApp(QMainWindow):
         server_info.setText(
             "API Endpoints:\n"
             "GET http://localhost:8000/health - Check server status\n"
-            "GET http://localhost:8000/codes/{email} - Get verification codes\n"
+            "GET http://localhost:8000/codes/{email}?query=Your%20ChatGPT%20code - Get verification codes\n"
         )
         layout.addWidget(server_info)
 
@@ -743,18 +808,27 @@ class UnifiedApp(QMainWindow):
         self.email_input = QLineEdit()
         self.email_input.setPlaceholderText('Enter email to get verification code')
         email_layout.addWidget(self.email_input)
-        
+        self.email_input.returnPressed.connect(self.get_verification_code)
+        layout.addLayout(email_layout)
+
+        query_layout = QHBoxLayout()
+        query_layout.addWidget(QLabel('Search Query:'))
+        self.query_input = QLineEdit()
+        self.query_input.setPlaceholderText('Optional search phrase (e.g., "Your ChatGPT code")')
+        query_layout.addWidget(self.query_input)
+        self.query_input.returnPressed.connect(self.get_verification_code)
+        layout.addLayout(query_layout)
+
         verification_buttons = QHBoxLayout()
         self.get_code_button = QPushButton('Get Verification Code')
         self.get_code_button.clicked.connect(self.get_verification_code)
         verification_buttons.addWidget(self.get_code_button)
-        
+
         self.clear_log_button = QPushButton('Clear Log')
         self.clear_log_button.clicked.connect(self.clear_verification_log)
         verification_buttons.addWidget(self.clear_log_button)
-        
-        email_layout.addLayout(verification_buttons)
-        layout.addLayout(email_layout)
+
+        layout.addLayout(verification_buttons)
 
         # Create split view for response and logs
         response_log_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -1024,13 +1098,22 @@ class UnifiedApp(QMainWindow):
             self.log_verification_step("❌ Error: No email address provided")
             return
 
+        query = self.query_input.text().strip() if hasattr(self, 'query_input') else ''
+
         try:
-            self.log_verification_step(f"🔍 Starting verification code search for {email}")
+            if query:
+                self.log_verification_step(
+                    f"🔍 Starting verification code search for {email} with query '{query}'"
+                )
+            else:
+                self.log_verification_step(f"🔍 Starting verification code search for {email}")
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            
+
             self.log_verification_step("📤 Sending request to API...")
+            params = {'query': query} if query else None
             response = requests.get(
                 f"http://localhost:8000/codes/{email}",
+                params=params,
                 verify=False
             )
             
@@ -1038,15 +1121,22 @@ class UnifiedApp(QMainWindow):
                 result = response.json()
                 self.response_text.setText(json.dumps(result, indent=2))
                 self.log_verification_step(f"✅ Success: Found {len(result)} verification code(s)")
-                for idx, code_data in enumerate(result, 1):
-                    self.log_verification_step(f"   📌 Code {idx}: {code_data.get('code')} (Subject: {code_data.get('subject', 'N/A')})")
+                if result:
+                    for idx, code_data in enumerate(result, 1):
+                        self.log_verification_step(
+                            f"   📌 Code {idx}: {code_data.get('code')} (Subject: {code_data.get('subject', 'N/A')})"
+                        )
+                else:
+                    self.log_verification_step(
+                        "   ℹ️ No codes matched this search. Try broadening or clearing the query."
+                    )
                 self.update_status(f"Found {len(result)} verification codes")
             else:
                 error_message = f"API Error (Status {response.status_code}): {response.text}"
                 self.response_text.setText(error_message)
                 self.log_verification_step(f"❌ {error_message}")
                 self.update_status("Failed to get verification codes")
-            
+
         except Exception as e:
             error_message = f"Error getting verification code: {str(e)}"
             self.show_error(error_message)
